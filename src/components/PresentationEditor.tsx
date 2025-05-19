@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import Reveal from 'reveal.js';
 import { Maximize2, Minimize2, ImagePlus, FileDown, Save, Volume2 } from 'lucide-react';
-import { openai, generateNarration } from '../lib/openai';
+import { openai, generateNarration, generateSpeech } from '../lib/openai';
 import { imageQueue } from '../lib/imageQueue';
 import { jsPDF } from 'jspdf';
 import html2canvas from 'html2canvas';
@@ -28,6 +28,7 @@ interface SlideNarration {
   slideIndex: number;
   text: string;
   isPlaying: boolean;
+  audioUrl?: string; // OpenAI TTSで生成された音声のURL
 }
 
 export function PresentationEditor({ content, title, company, creator, onSave, onSavePresentation }: PresentationEditorProps) {
@@ -43,7 +44,9 @@ export function PresentationEditor({ content, title, company, creator, onSave, o
   const contentRef = useRef(content);
   const [narrations, setNarrations] = useState<SlideNarration[]>([]);
   const [isGeneratingNarration, setIsGeneratingNarration] = useState(false);
+  const [isGeneratingTTS, setIsGeneratingTTS] = useState(false);
   const speechSynthesisRef = useRef<SpeechSynthesisUtterance | null>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
 
   const generateImages = async () => {
     if (isGeneratingImages) return;
@@ -93,11 +96,33 @@ export function PresentationEditor({ content, title, company, creator, onSave, o
       
       for (let i = 0; i < slides.length; i++) {
         const narrationText = await generateNarration(slides[i]);
-        newNarrations.push({
-          slideIndex: i,
-          text: narrationText,
-          isPlaying: false
-        });
+        
+        // OpenAI TTSで音声を生成
+        setIsGeneratingTTS(true);
+        try {
+          const audioData = await generateSpeech(narrationText);
+          // ArrayBufferからBlobを作成
+          const blob = new Blob([audioData], { type: 'audio/mp3' });
+          // BlobからURLを作成
+          const audioUrl = URL.createObjectURL(blob);
+          
+          newNarrations.push({
+            slideIndex: i,
+            text: narrationText,
+            isPlaying: false,
+            audioUrl: audioUrl
+          });
+        } catch (ttsError) {
+          console.error("TTS生成エラー:", ttsError);
+          newNarrations.push({
+            slideIndex: i,
+            text: narrationText,
+            isPlaying: false
+          });
+        } finally {
+          setIsGeneratingTTS(false);
+        }
+        
         setProgress(prev => ({ ...prev, current: i + 1 }));
       }
 
@@ -112,10 +137,8 @@ export function PresentationEditor({ content, title, company, creator, onSave, o
   };
 
   const playNarration = (slideIndex: number) => {
-    // 他のナレーションが再生中であれば停止
-    if (speechSynthesisRef.current) {
-      window.speechSynthesis.cancel();
-    }
+    // 再生中の音声があれば停止
+    stopNarration();
 
     const narration = narrations.find(n => n.slideIndex === slideIndex);
     if (!narration) return;
@@ -128,8 +151,55 @@ export function PresentationEditor({ content, title, company, creator, onSave, o
       }))
     );
 
+    // OpenAI TTSで生成された音声があればそれを使用
+    if (narration.audioUrl) {
+      if (!audioRef.current) {
+        audioRef.current = new Audio();
+      }
+      
+      const audio = audioRef.current;
+      audio.src = narration.audioUrl;
+      audio.onended = () => {
+        setNarrations(prev => 
+          prev.map(n => ({
+            ...n,
+            isPlaying: false
+          }))
+        );
+      };
+      
+      audio.onerror = () => {
+        console.error('音声再生エラー:', audio.error);
+        setNarrations(prev => 
+          prev.map(n => ({
+            ...n,
+            isPlaying: false
+          }))
+        );
+        
+        // フォールバック: ブラウザのSpeech Synthesis APIを使用
+        useBrowserSpeechSynthesis(narration.text);
+      };
+      
+      audio.play().catch(error => {
+        console.error('音声再生エラー:', error);
+        // フォールバック: ブラウザのSpeech Synthesis APIを使用
+        useBrowserSpeechSynthesis(narration.text);
+      });
+    } else {
+      // OpenAI TTSで生成された音声がない場合はブラウザのSpeech Synthesis APIを使用
+      useBrowserSpeechSynthesis(narration.text);
+    }
+  };
+
+  // ブラウザのSpeech Synthesis APIを使用
+  const useBrowserSpeechSynthesis = (text: string) => {
+    if (speechSynthesisRef.current) {
+      window.speechSynthesis.cancel();
+    }
+
     // Speech Synthesis の設定
-    const utterance = new SpeechSynthesisUtterance(narration.text);
+    const utterance = new SpeechSynthesisUtterance(text);
     utterance.lang = 'ja-JP';
     utterance.rate = 1.0;
     utterance.pitch = 1.0;
@@ -163,16 +233,25 @@ export function PresentationEditor({ content, title, company, creator, onSave, o
   };
 
   const stopNarration = () => {
+    // Speech Synthesis APIを停止
     if (speechSynthesisRef.current) {
       window.speechSynthesis.cancel();
-      setNarrations(prev => 
-        prev.map(n => ({
-          ...n,
-          isPlaying: false
-        }))
-      );
       speechSynthesisRef.current = null;
     }
+    
+    // Audio要素を停止
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current.currentTime = 0;
+    }
+    
+    // 再生状態をリセット
+    setNarrations(prev => 
+      prev.map(n => ({
+        ...n,
+        isPlaying: false
+      }))
+    );
   };
 
   const exportToPDF = async () => {
@@ -556,11 +635,16 @@ export function PresentationEditor({ content, title, company, creator, onSave, o
               </div>
             </div>
           )}
-          {isGeneratingNarration && (
+          {(isGeneratingNarration || isGeneratingTTS) && (
             <div className="absolute inset-0 bg-white/80 z-50 flex items-center justify-center">
               <div className="text-center">
                 <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mb-4"></div>
-                <p className="text-gray-600">ナレーションを生成中... ({progress.current}/{progress.total})</p>
+                <p className="text-gray-600">
+                  {isGeneratingTTS 
+                    ? "音声を生成中..."
+                    : `ナレーションを生成中... (${progress.current}/${progress.total})`
+                  }
+                </p>
                 {error && (
                   <p className="text-red-600 mt-2 text-sm">{error}</p>
                 )}
@@ -597,9 +681,9 @@ export function PresentationEditor({ content, title, company, creator, onSave, o
             </button>
             <button
               onClick={generateNarrations}
-              disabled={isGeneratingNarration}
+              disabled={isGeneratingNarration || isGeneratingTTS}
               className="p-3 bg-blue-600 hover:bg-blue-700 rounded-full shadow-lg transition-colors disabled:bg-blue-400 disabled:cursor-not-allowed"
-              title="AIでナレーションを生成"
+              title="GPT-4o mini + TTSでナレーションを生成"
             >
               <Volume2 className="w-6 h-6 text-white" />
             </button>
@@ -662,9 +746,12 @@ export function PresentationEditor({ content, title, company, creator, onSave, o
                   <div className="flex justify-end mt-2">
                     <button 
                       onClick={() => playNarration(deck.current?.getIndices().h || 0)}
-                      className="text-xs px-2 py-1 bg-blue-600 text-white rounded hover:bg-blue-700"
+                      className="text-xs px-2 py-1 bg-blue-600 text-white rounded hover:bg-blue-700 flex items-center gap-1"
                     >
-                      再生
+                      <Volume2 className="w-3 h-3" />
+                      {narrations.find(n => n.slideIndex === deck.current?.getIndices().h)?.audioUrl 
+                        ? "AI音声で再生" 
+                        : "再生"}
                     </button>
                   </div>
                 </div>
